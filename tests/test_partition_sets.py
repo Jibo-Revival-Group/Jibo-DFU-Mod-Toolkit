@@ -117,6 +117,43 @@ class PartitionSetTests(unittest.TestCase):
                                          root / "operation", True)
             write.assert_not_called()
 
+    def _flash(self, root, data, confirm=True, backup_status="backup complete"):
+        image = root / "custom.img"
+        image.write_bytes(data)
+        layout = {"rootfsA": {"first_lba": 10, "last_lba": 13, "size_bytes": 1024,
+                              "transfer": "partition"}}
+        digest = hashlib.sha256(data).hexdigest()
+        with patch.object(j, "available_backup_partitions", return_value=("1-1", TAG, layout)), \
+                patch.object(j, "backup_partitions", return_value={
+                    "status": backup_status, "manifest": str(root / "b.json")}) as backup, \
+                patch.object(j, "run_with_progress") as write, \
+                patch.object(j, "_upload_partition", return_value=digest) as read:
+            result = j.flash_images({"rootfsA": str(image)}, "1-1", "dfu-util",
+                                    root / "operation", confirm)
+        return result, backup, write, read
+
+    def test_flash_backs_up_then_writes_and_reads_back_only_the_image_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result, backup, write, read = self._flash(Path(temporary), b"x" * 512)
+            self.assertEqual(result["status"], "verified")
+            backup.assert_called_once()
+            write.assert_called_once()
+            self.assertEqual(read.call_args.args[2:4], ("rootfsA", 512))
+            self.assertEqual(read.call_args.args[5], 1024)
+
+    def test_flash_refuses_bad_images_and_cancel_before_any_backup_or_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for data, message in ((b"x" * 1536, "larger than"), (b"x" * 100, "512-byte")):
+                with self.assertRaisesRegex(j.DfuError, message):
+                    self._flash(root, data)
+            result, backup, write, _ = self._flash(root, b"x" * 512, confirm=False)
+            self.assertEqual(result["status"], "cancelled")
+            backup.assert_not_called()
+            write.assert_not_called()
+            with self.assertRaisesRegex(j.DfuError, "backup did not finish"):
+                self._flash(root, b"x" * 512, backup_status="cancelled")
+
 
 if __name__ == "__main__":
     unittest.main()

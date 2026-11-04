@@ -1552,39 +1552,9 @@ def _restore_partitions(manifest, partitions, port, dfu_util, out, confirmation)
               "selected": list(selected), "writes": [], "status": "ready"}
     _private_write(record_path, record)
     try:
-        for name in selected:
-            entry = by_name[name]
-            size = entry["size_bytes"]
-            write = {"name": name, "size_bytes": size, "sha256": entry["sha256"],
-                     "status": "write started"}
-            record["writes"].append(write)
-            record["status"] = "write started"
-            _private_write(record_path, record)
-            if name == "skills" and available[name]["transfer"] == "bounded chunks":
-                names, listing = dfu_alternatives(dfu_util, port)
-                chunks = _validate_skills_chunk_alternatives(size, names, listing)
-                _write_skills_chunks(dfu_util, port, entry["image"], size, chunks,
-                                     directory, record_path, record, write)
-            else:
-                run_with_progress(_partition_transfer_argv(dfu_util, port, name, "-D",
-                                                           entry["image"]),
-                                  timeout=14400, label="Restoring " + name,
-                                  download_size=size,
-                                  allow_progress_completion=True)
-                with tempfile.TemporaryDirectory(prefix="restore-readback-", dir=directory) as temp:
-                    readback = Path(temp) / "partition.img"
-                    actual = (_upload_var(dfu_util, port, readback) if name == "var" else
-                              _upload_partition(dfu_util, port, name, size, readback))
-                write["readback_sha256"] = actual
-                if actual != entry["sha256"]:
-                    write["status"] = "readback mismatch"
-                    record["status"] = "readback mismatch"
-                    _private_write(record_path, record)
-                    raise DfuError("{} did not match its readback. No further partitions were written.".format(name))
-                write["status"] = "verified"
-                _private_write(record_path, record)
-        record["status"] = "verified"
-        _private_write(record_path, record)
+        images = {name: (by_name[name]["image"], by_name[name]["size_bytes"], by_name[name]["sha256"])
+                  for name in selected}
+        _write_and_verify(images, available, port, dfu_util, directory, record_path, record, "Restoring ")
         return {"status": "verified", "partitions": list(selected),
                 "operation_directory": str(directory), "manifest": str(record_path)}
     except Exception as exc:
@@ -1592,6 +1562,99 @@ def _restore_partitions(manifest, partitions, port, dfu_util, out, confirmation)
             record.update(status="failed", error=str(exc))
             _private_write(record_path, record)
         raise
+
+
+def _write_and_verify(images, available, port, dfu_util, directory, record_path, record, label):
+    """Write each {partition: (image, size, sha256)} in order and check it by reading it back.
+
+    An image shorter than its partition writes and reads back only its own bytes;
+    the rest of the partition is left as it was.
+    """
+    for name, (image, size, digest) in images.items():
+        full = available[name]["size_bytes"]
+        write = {"name": name, "size_bytes": size, "sha256": digest, "status": "write started"}
+        record["writes"].append(write)
+        record["status"] = "write started"
+        _private_write(record_path, record)
+        if name == "skills" and available[name]["transfer"] == "bounded chunks":
+            names, listing = dfu_alternatives(dfu_util, port)
+            chunks = _validate_skills_chunk_alternatives(full, names, listing)
+            _write_skills_chunks(dfu_util, port, image, full, chunks,
+                                 directory, record_path, record, write, transfer_size=size)
+        else:
+            run_with_progress(_partition_transfer_argv(dfu_util, port, name, "-D", image),
+                              timeout=14400, label=label + name, download_size=size,
+                              allow_progress_completion=True)
+            with tempfile.TemporaryDirectory(prefix="restore-readback-", dir=directory) as temp:
+                readback = Path(temp) / "partition.img"
+                actual = (_upload_var(dfu_util, port, readback) if name == "var" and size == full else
+                          _upload_partition(dfu_util, port, name, size, readback,
+                                            None if size == full else full))
+            write["readback_sha256"] = actual
+            if actual != digest:
+                write["status"] = "readback mismatch"
+                record["status"] = "readback mismatch"
+                _private_write(record_path, record)
+                raise DfuError("{} did not match its readback. No further partitions were written.".format(name))
+            write["status"] = "verified"
+            _private_write(record_path, record)
+    record["status"] = "verified"
+    _private_write(record_path, record)
+
+
+def flash_images(images, port=None, dfu_util=None, out=None, confirmation=None):
+    """Write any .img files to the chosen partitions: {partition name: image path}.
+
+    Each image must fit its live GPT partition and be whole 512-byte sectors. After the
+    review, the chosen partitions are backed up into a new backup set, then each image is
+    written and read back.
+    """
+    dfu_util = dfu_util or tool("dfu-util")
+    port, device_tag, available = available_backup_partitions(port, dfu_util)
+    selected = _selected_partitions(tuple(images), available)
+    checked = {}
+    for name in selected:
+        image = Path(images[name]).expanduser()
+        if image.is_symlink() or not image.is_file():
+            raise DfuError("The image for {} is missing or is a symbolic link.".format(name))
+        image = image.resolve()
+        size, full = image.stat().st_size, available[name]["size_bytes"]
+        if size <= 0 or size % SKILLS_SECTOR_SIZE:
+            raise DfuError("{} is not a whole number of 512-byte sectors.".format(image.name))
+        if size > full:
+            raise DfuError("{} is {} bytes, larger than the {} partition ({} bytes).".format(
+                image.name, size, name, full))
+        checked[name] = (str(image), size, _sha256_file(image))
+    plan = {"operation": "flash images to partitions", "usb_port": port,
+            "readback_policy": "each partition is backed up first, then read back after writing",
+            "partitions": [{"name": name, "bytes": checked[name][1],
+                            "image": checked[name][0]} for name in selected]}
+    if confirmation is None:
+        accepted = _confirm_file_write(None, plan)
+    elif callable(confirmation):
+        accepted = bool(confirmation(plan))
+    else:
+        accepted = bool(confirmation)
+    if not accepted:
+        return {"status": "cancelled", "message": "No partition was written."}
+    backup = backup_partitions(selected, port=port, dfu_util=dfu_util)
+    if backup.get("status") != "backup complete":
+        raise DfuError("The backup did not finish, so nothing was written.")
+    directory = _new_operation_dir(out, "flash-images")
+    record_path = directory / "flash-manifest.json"
+    record = {"schema": 1, "kind": "jibo-partition-flash", "created_utc": _utc_now(),
+              "device_tag": device_tag, "usb_port": port, "backup_manifest": backup["manifest"],
+              "selected": list(selected), "writes": [], "status": "ready"}
+    _private_write(record_path, record)
+    try:
+        _write_and_verify(checked, available, port, dfu_util, directory, record_path, record, "Flashing ")
+    except Exception as exc:
+        if record["status"] != "readback mismatch":
+            record.update(status="failed", error=str(exc))
+            _private_write(record_path, record)
+        raise
+    return {"status": "verified", "partitions": list(selected), "backup": backup["manifest"],
+            "operation_directory": str(directory), "manifest": str(record_path)}
 
 
 def _expected_skills_chunks(capacity):

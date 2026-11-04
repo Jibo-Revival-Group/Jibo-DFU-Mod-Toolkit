@@ -1382,7 +1382,8 @@ def _confirmation_details(plan, introduction):
             if isinstance(partition, dict):
                 name = partition.get("name", "unknown")
                 size = partition.get("bytes")
-                lines.append("  {}{}".format(name, " ({} bytes)".format(size) if size is not None else ""))
+                lines.append("  {}{}{}".format(name, " ({} bytes)".format(size) if size is not None else "",
+                                               " \u2190 " + partition["image"] if partition.get("image") else ""))
             else:
                 lines.append("  " + str(partition))
     changes = plan.get("changes")
@@ -1614,6 +1615,9 @@ def _backup_menu_options(readiness):
         MenuItem("restore-backup", "Restore partitions", ready,
                  reason or "Pick a saved backup of this Jibo and the partitions to put back. "
                            "You review everything before anything is written."),
+        MenuItem("flash-images", "Flash .img files to partitions", ready,
+                 reason or "Write your own image to the partitions you choose. Those partitions "
+                           "are backed up first and checked after writing."),
         MenuItem("saved-backups", SAVED_BACKUPS_TITLE,
                  reason="Every backup on this computer: robot, date, partitions and size."),
         MenuItem("backup-var", "Save or check a var backup", ready,
@@ -1720,6 +1724,30 @@ def _restore_from_other_folder(api, readiness):
         return {"status": "cancelled", "message": "This backup is not complete, so it cannot be "
                                                   "restored. Nothing was written."}
     return _restore_from_entry(api, readiness, entry)
+
+
+def _flash_images_flow(api, readiness):
+    _, _, available = api.available_backup_partitions(port=readiness.port)
+    if not available:
+        raise RuntimeError("This DFU loader exposes no complete partitions.")
+    selected = select_multiple_options(
+        "Flash .img files to partitions", partition_checklist(available),
+        detail="Choose the partitions to write. You pick an image for each next.")
+    if selected is None:
+        return {"status": "cancelled", "message": "Nothing was written."}
+    images = {}
+    for name in selected:
+        path = text_input("Flash .img files to partitions",
+                          "Path to the .img for {}:".format(name),
+                          detail="The {} partition is {}. A smaller image writes only its own "
+                                 "bytes.".format(name, size_label(available[name]["size_bytes"])))
+        if path is None or not path.strip():
+            return {"status": "cancelled", "message": "Nothing was written."}
+        images[name] = path.strip()
+    confirmation = lambda plan: confirm_action(
+        "Confirm image flash", _confirmation_details(
+            plan, "These partitions will be backed up, then replaced with your images."))
+    return api.flash_images(images, port=readiness.port, confirmation=confirmation)
 
 
 def _restore_partitions_flow(api, readiness):
@@ -1852,7 +1880,7 @@ def _backups_menu(api, readiness):
                                     "each Jibo. Making a backup never writes to the robot.")
     if selected is None:
         return {"status": "cancelled", "message": "No backup action selected."}
-    if selected in ("backup-all", "backup-choose", "restore-backup", "backup-var") and \
+    if selected in ("backup-all", "backup-choose", "restore-backup", "flash-images", "backup-var") and \
             readiness.state != "dfu-ready":
         raise RuntimeError("This backup action is available only while the robot is in DFU.")
     if selected == "backup-all":
@@ -1865,6 +1893,8 @@ def _backups_menu(api, readiness):
         return _choose_partitions_to_back_up(api, readiness)
     if selected == "restore-backup":
         return _restore_partitions_flow(api, readiness)
+    if selected == "flash-images":
+        return _flash_images_flow(api, readiness)
     if selected == "saved-backups":
         return _saved_backups_flow(api, readiness)
     return api.backup_var(port=readiness.port)
