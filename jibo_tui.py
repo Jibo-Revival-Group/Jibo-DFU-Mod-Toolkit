@@ -1603,6 +1603,9 @@ def _connected_robot(api, readiness):
     return tag, bool(tag)
 
 
+FLASH_IMAGE_TITLE = "Flash an .img or .bin"
+
+
 def _backup_menu_options(readiness):
     reason = _connection_reason(readiness)
     ready = readiness.state == "dfu-ready"
@@ -1615,9 +1618,10 @@ def _backup_menu_options(readiness):
         MenuItem("restore-backup", "Restore partitions", ready,
                  reason or "Pick a saved backup of this Jibo and the partitions to put back. "
                            "You review everything before anything is written."),
-        MenuItem("flash-images", "Flash .img files to partitions", ready,
-                 reason or "Write your own image to the partitions you choose. Those partitions "
-                           "are backed up first and checked after writing."),
+        MenuItem("flash-images", FLASH_IMAGE_TITLE, ready,
+                 reason or "Write a whole-disk .img/.bin, split into its partitions, or one "
+                           "partition image. Those partitions are backed up first and checked "
+                           "after writing."),
         MenuItem("saved-backups", SAVED_BACKUPS_TITLE,
                  reason="Every backup on this computer: robot, date, partitions and size."),
         MenuItem("backup-var", "Save or check a var backup", ready,
@@ -1727,27 +1731,49 @@ def _restore_from_other_folder(api, readiness):
 
 
 def _flash_images_flow(api, readiness):
+    """One .img/.bin: a whole-disk image is split by its GPT; any other image goes to one partition."""
     _, _, available = api.available_backup_partitions(port=readiness.port)
     if not available:
         raise RuntimeError("This DFU loader exposes no complete partitions.")
-    selected = select_multiple_options(
-        "Flash .img files to partitions", partition_checklist(available),
-        detail="Choose the partitions to write. You pick an image for each next.")
-    if selected is None:
+    path = text_input(FLASH_IMAGE_TITLE, "Path to the .img or .bin file:",
+                      detail="A whole-disk image (with a partition table) is split into its "
+                             "partitions. Any other image is written to one partition you choose.")
+    if path is None or not path.strip():
         return {"status": "cancelled", "message": "Nothing was written."}
-    images = {}
-    for name in selected:
-        path = text_input("Flash .img files to partitions",
-                          "Path to the .img for {}:".format(name),
-                          detail="The {} partition is {}. A smaller image writes only its own "
-                                 "bytes.".format(name, size_label(available[name]["size_bytes"])))
-        if path is None or not path.strip():
-            return {"status": "cancelled", "message": "Nothing was written."}
-        images[name] = path.strip()
+    image = Path(path.strip()).expanduser()
     confirmation = lambda plan: confirm_action(
         "Confirm image flash", _confirmation_details(
-            plan, "These partitions will be backed up, then replaced with your images."))
-    return api.flash_images(images, port=readiness.port, confirmation=confirmation)
+            plan, "These partitions will be backed up, then replaced from your image."))
+    layout = api.disk_image_layout(image)
+    if layout is None:
+        name = select_option(FLASH_IMAGE_TITLE, partition_checklist(available),
+                             prompt="Which partition should {} replace?".format(image.name),
+                             detail="This image has no partition table, so it is written to one "
+                                    "partition. A smaller image replaces only its own bytes.")
+        if name is None:
+            return {"status": "cancelled", "message": "Nothing was written."}
+        return api.flash_images({name: str(image)}, port=readiness.port, confirmation=confirmation)
+    keys = ("first_lba", "last_lba", "size_bytes")
+    choices = tuple(PartitionItem(
+        name, "{}  \u2014  {}".format(name, size_label(extent["size_bytes"])),
+        name in available and all(available[name][k] == extent[k] for k in keys),
+        "Not available over USB on this Jibo." if name not in available else
+        "At a different place than on this Jibo, so it cannot be written."
+        if any(available[name][k] != extent[k] for k in keys) else
+        "{} to write and check; USB speed varies.".format(
+            estimate_text(extent["size_bytes"], ESTIMATE_RESTORE_FACTOR).capitalize()),
+        size_bytes=extent["size_bytes"]) for name, extent in layout.items())
+    usable = tuple(item.key for item in choices if item.enabled)
+    if not usable:
+        return {"status": "cancelled", "message": "None of this image's partitions match this "
+                                                  "Jibo's layout. Nothing was written."}
+    selected = select_multiple_options(
+        "Choose partitions to flash", choices, initial=usable,
+        detail="These partitions are in {}. Only the ones you check are written; the partition "
+               "table itself is never written.".format(image.name))
+    if selected is None:
+        return {"status": "cancelled", "message": "Nothing was written."}
+    return api.flash_disk_image(image, selected, port=readiness.port, confirmation=confirmation)
 
 
 def _restore_partitions_flow(api, readiness):

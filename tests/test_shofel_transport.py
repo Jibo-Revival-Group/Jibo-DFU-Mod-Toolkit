@@ -12,8 +12,8 @@ from unittest.mock import patch
 import jibo_dfu as toolkit
 
 
-def make_gpt_prefix(var_size=toolkit.EXPECTED_VAR_SIZE):
-    names_and_sizes = (
+def make_gpt_prefix(var_size=toolkit.EXPECTED_VAR_SIZE, names_and_sizes=None):
+    names_and_sizes = names_and_sizes or (
         ("rootfsA", 1_048_576_000),
         ("rootfsB", 1_048_576_000),
         ("recovery", 52_428_800),

@@ -152,10 +152,14 @@ def test_real_window_drives_backend_backup_and_cancel_default_restore(offline):
         if not w.closed: w.close()
 
 
-def test_real_window_flash_images_picks_an_image_per_partition_and_cancel_writes_nothing(offline, tmp_path):
+def test_real_window_flash_whole_disk_image_lists_its_partitions_and_cancel_writes_nothing(offline, tmp_path):
     import jibo_gui as gui
-    image = tmp_path / "custom-services.img"
-    image.write_bytes(b"x" * 1024)
+    from test_partition_sets import make_disk
+    image, layout = make_disk(tmp_path)
+    live = {name: layout[name] for name in ("rootfsA", "services", "var")}
+    live["var"] = dict(live["var"], first_lba=live["var"]["first_lba"] + 8)  # moved on this robot
+    offline.layout.clear()
+    offline.layout.update(live)
     api = BackupApi(offline.root)
     c = core.GuiController(api)
     root = gui.create_root()
@@ -176,23 +180,23 @@ def test_real_window_flash_images_picks_an_image_per_partition_and_cancel_writes
             w.render_state()
             w.action_rows["backups"].activate()
             pump(lambda: w.prompt is not None)
-            assert "flash-images" in w.controls["options"]
             previous = w.prompt
             w.controls["choose"]("flash-images")
             w.controls["primary"].invoke()
-            pump(lambda: w.prompt is not None and w.prompt is not previous and w.prompt.kind == "multi")
-            w.controls["all"](False)
-            w.controls["toggle"]("services")
-            w.controls["primary"].invoke()
-            pump(lambda: w.prompt is not None and w.prompt.kind == "text")
-            assert "services" in w.prompt.prompt
+            pump(lambda: w.prompt is not None and w.prompt is not previous and w.prompt.kind == "text")
+            assert ".bin" in w.prompt.prompt
             w.controls["value"].set(str(image))
+            w.controls["primary"].invoke()
+            pump(lambda: w.prompt is not None and w.prompt.kind == "multi")
+            assert w.controls["chosen"] == {"rootfsA", "services"}  # var moved, others not on USB
+            w.controls["toggle"]("rootfsA")
             w.controls["primary"].invoke()
             pump(lambda: w.prompt is not None and w.prompt.kind == "confirm")
             assert w.prompt.initial == "cancel"
             assert root.focus_get() is w.controls["cancel"]
             review = w.controls["review"].get()
-            assert "services (1024 bytes)" in review and str(image) in review
+            assert "services (8192 bytes)" in review and "rootfsA" not in review
+            assert "{} at byte {}".format(image, layout["services"]["first_lba"] * 512) in review
             w.controls["cancel"].invoke()
             pump(lambda: not c.busy and w.page_name == "result")
             assert offline.uploads == [] and not offline.forbidden

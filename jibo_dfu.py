@@ -1602,17 +1602,28 @@ def _write_and_verify(images, available, port, dfu_util, directory, record_path,
     _private_write(record_path, record)
 
 
-def flash_images(images, port=None, dfu_util=None, out=None, confirmation=None):
-    """Write any .img files to the chosen partitions: {partition name: image path}.
+def disk_image_layout(image):
+    """The GPT partitions inside a whole-disk .img/.bin, or None when it has no primary GPT."""
+    image = Path(image).expanduser()
+    if image.is_symlink() or not image.is_file():
+        raise DfuError("The image is missing or is a symbolic link.")
+    with image.open("rb") as stream:
+        prefix = stream.read(bounded.MARKER_BYTES)
+    try:
+        return updates.parse_gpt_layout_prefix(prefix)
+    except updates.UpdateError:
+        return None
 
-    Each image must fit its live GPT partition and be whole 512-byte sectors. After the
-    review, the chosen partitions are backed up into a new backup set, then each image is
-    written and read back.
+
+def flash_images(images, port=None, dfu_util=None, out=None, confirmation=None):
+    """Write single-partition .img files to the chosen partitions: {partition name: image path}.
+
+    Each image must fit its live GPT partition and be whole 512-byte sectors.
     """
     dfu_util = dfu_util or tool("dfu-util")
     port, device_tag, available = available_backup_partitions(port, dfu_util)
     selected = _selected_partitions(tuple(images), available)
-    checked = {}
+    sources = {}
     for name in selected:
         image = Path(images[name]).expanduser()
         if image.is_symlink() or not image.is_file():
@@ -1624,11 +1635,48 @@ def flash_images(images, port=None, dfu_util=None, out=None, confirmation=None):
         if size > full:
             raise DfuError("{} is {} bytes, larger than the {} partition ({} bytes).".format(
                 image.name, size, name, full))
-        checked[name] = (str(image), size, _sha256_file(image))
-    plan = {"operation": "flash images to partitions", "usb_port": port,
+        sources[name] = (image, 0, size)
+    return _flash_sources(sources, "flash images to partitions", port, device_tag, available,
+                          dfu_util, out, confirmation)
+
+
+def flash_disk_image(image, partitions, port=None, dfu_util=None, out=None, confirmation=None):
+    """Split the chosen partitions out of one whole-disk image (with a GPT) and write them.
+
+    Each chosen partition must sit at exactly the same place in the image's GPT as in the
+    robot's live GPT. The GPT itself and partitions not chosen are never written.
+    """
+    dfu_util = dfu_util or tool("dfu-util")
+    image = Path(image).expanduser()
+    layout = disk_image_layout(image)
+    if layout is None:
+        raise DfuError("{} has no partition table, so it is not a whole-disk image.".format(image.name))
+    image = image.resolve()
+    port, device_tag, available = available_backup_partitions(port, dfu_util)
+    selected = _selected_partitions(partitions, available)
+    sources = {}
+    for name in selected:
+        extent = layout.get(name)
+        if not extent:
+            raise DfuError("The image has no {} partition.".format(name))
+        if any(extent[key] != available[name][key] for key in ("first_lba", "last_lba", "size_bytes")):
+            raise DfuError("{} is at a different place in the image than on this Jibo.".format(name))
+        offset = extent["first_lba"] * SKILLS_SECTOR_SIZE
+        if offset + extent["size_bytes"] > image.stat().st_size:
+            raise DfuError("The image ends before the end of its {} partition.".format(name))
+        sources[name] = (image, offset, extent["size_bytes"])
+    return _flash_sources(sources, "flash partitions from a whole-disk image", port, device_tag,
+                          available, dfu_util, out, confirmation)
+
+
+def _flash_sources(sources, operation, port, device_tag, available, dfu_util, out, confirmation):
+    """Review, back up the chosen partitions, then write {name: (file, offset, size)} and read back."""
+    selected = tuple(sources)
+    plan = {"operation": operation, "usb_port": port,
             "readback_policy": "each partition is backed up first, then read back after writing",
-            "partitions": [{"name": name, "bytes": checked[name][1],
-                            "image": checked[name][0]} for name in selected]}
+            "partitions": [{"name": name, "bytes": size,
+                            "image": str(path) if not offset else "{} at byte {}".format(path, offset)}
+                           for name, (path, offset, size) in sources.items()]}
     if confirmation is None:
         accepted = _confirm_file_write(None, plan)
     elif callable(confirmation):
@@ -1647,12 +1695,26 @@ def flash_images(images, port=None, dfu_util=None, out=None, confirmation=None):
               "selected": list(selected), "writes": [], "status": "ready"}
     _private_write(record_path, record)
     try:
+        if shutil.disk_usage(directory).free < sum(size for _, offset, size in sources.values()
+                                                   if offset) + 1024 ** 3:
+            raise DfuError("Not enough free space to split the image. Nothing was written.")
+        checked = {}
+        for name, (path, offset, size) in sources.items():
+            if offset:  # a slice of a whole-disk image is written from its own file
+                piece = directory / (name + ".img")
+                checked[name] = (str(piece), size, _copy_file_slice(path, offset, size, piece))
+            else:
+                checked[name] = (str(path), size, _sha256_file(path))
         _write_and_verify(checked, available, port, dfu_util, directory, record_path, record, "Flashing ")
     except Exception as exc:
         if record["status"] != "readback mismatch":
             record.update(status="failed", error=str(exc))
             _private_write(record_path, record)
         raise
+    finally:
+        for name, (_path, offset, _size) in sources.items():
+            if offset:
+                (directory / (name + ".img")).unlink(missing_ok=True)
     return {"status": "verified", "partitions": list(selected), "backup": backup["manifest"],
             "operation_directory": str(directory), "manifest": str(record_path)}
 

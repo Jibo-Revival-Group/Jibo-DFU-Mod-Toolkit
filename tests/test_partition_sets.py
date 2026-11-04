@@ -7,9 +7,26 @@ from pathlib import Path
 from unittest.mock import patch
 
 import jibo_dfu as j
+from test_shofel_transport import make_gpt_prefix
 
 
 TAG = "serial-sha256:" + "a" * 64
+PARTS = (("rootfsA", 4096), ("rootfsB", 4096), ("recovery", 1024), ("services", 8192),
+         ("var", 2048), ("skills", 2048))
+
+
+def make_disk(root, parts=PARTS, cut=0):
+    """A whole-disk image: GPT in LBA 0-33, then each partition filled with its own letter."""
+    disk = bytearray(make_gpt_prefix(names_and_sizes=parts)[:34 * 512])
+    layout, lba = {}, 34
+    for name, size in parts:
+        layout[name] = {"first_lba": lba, "last_lba": lba + size // 512 - 1, "size_bytes": size,
+                        "transfer": "partition"}
+        disk += name[0].encode() * size
+        lba += size // 512
+    path = Path(root) / "jibo-full.bin"
+    path.write_bytes(bytes(disk[:len(disk) - cut]))
+    return path, layout
 
 
 class PartitionSetTests(unittest.TestCase):
@@ -153,6 +170,58 @@ class PartitionSetTests(unittest.TestCase):
             write.assert_not_called()
             with self.assertRaisesRegex(j.DfuError, "backup did not finish"):
                 self._flash(root, b"x" * 512, backup_status="cancelled")
+
+    PARTS = PARTS
+
+    def _disk(self, root, parts=PARTS, cut=0):
+        return make_disk(root, parts, cut)
+
+    def _flash_disk(self, root, image, layout, live=None, confirm=True):
+        written = {}
+        def write(argv, **kwargs):
+            written[argv[argv.index("-a") + 1]] = Path(argv[argv.index("-D") + 1]).read_bytes()
+        def read(_tool, _port, name, size, _destination, *rest):
+            return hashlib.sha256(written[name][:size]).hexdigest()
+        with patch.object(j, "available_backup_partitions", return_value=("1-1", TAG, live or layout)), \
+                patch.object(j, "backup_partitions", return_value={
+                    "status": "backup complete", "manifest": str(root / "b.json")}) as backup, \
+                patch.object(j, "_partition_transfer_argv",
+                             side_effect=lambda tool, port, name, option, path, *a: ["-a", name, option, str(path)]), \
+                patch.object(j, "run_with_progress", side_effect=write), \
+                patch.object(j, "_upload_partition", side_effect=read):
+            result = j.flash_disk_image(image, ("services", "rootfsB"), "1-1", "dfu-util",
+                                        root / "operation", confirm)
+        return result, backup, written
+
+    def test_disk_image_is_split_by_its_gpt_and_only_chosen_partitions_are_written(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image, layout = self._disk(root)
+            self.assertEqual(j.disk_image_layout(image)["services"]["first_lba"],
+                             layout["services"]["first_lba"])
+            result, backup, written = self._flash_disk(root, image, layout)
+            self.assertEqual(result["status"], "verified")
+            backup.assert_called_once()
+            self.assertEqual(written, {"services": b"s" * 8192, "rootfsB": b"r" * 4096})
+            self.assertEqual(list((root / "operation").glob("*.img")), [], "split pieces are removed")
+
+    def test_disk_image_refuses_moved_partitions_short_files_and_non_gpt_before_any_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image, layout = self._disk(root)
+            moved = {name: dict(extent) for name, extent in layout.items()}
+            moved["services"]["first_lba"] += 1
+            with self.assertRaisesRegex(j.DfuError, "different place"):
+                self._flash_disk(root, image, layout, live=moved)
+            parts = self.PARTS[:3] + (("var", 2048), ("skills", 2048), ("services", 8192))
+            short, layout = self._disk(root, parts=parts, cut=512)
+            with self.assertRaisesRegex(j.DfuError, "ends before"):
+                self._flash_disk(root, short, layout)
+            plain = root / "plain.img"
+            plain.write_bytes(b"x" * 4096)
+            self.assertIsNone(j.disk_image_layout(plain))
+            with self.assertRaisesRegex(j.DfuError, "no partition table"):
+                self._flash_disk(root, plain, layout)
 
 
 if __name__ == "__main__":

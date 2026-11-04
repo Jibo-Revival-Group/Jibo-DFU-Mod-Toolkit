@@ -330,6 +330,8 @@ class BackupApi(FakeApi):
     def delete_backup_set(self, *a): return dfu.delete_backup_set(*a)
     def restore_partitions(self, *a, **kw): return dfu.restore_partitions(*a, dfu_util="fixture-dfu", **kw)
     def flash_images(self, *a, **kw): return dfu.flash_images(*a, dfu_util="fixture-dfu", **kw)
+    def flash_disk_image(self, *a, **kw): return dfu.flash_disk_image(*a, dfu_util="fixture-dfu", **kw)
+    def disk_image_layout(self, *a): return dfu.disk_image_layout(*a)
     def open_folder(self, path):
         self.calls.append(("open_folder", path))
         return True  # Never launch the real desktop in acceptance tests.
@@ -398,3 +400,13 @@ def test_tui_backup_menu_runs_real_backend_with_only_selected_partition(offline)
     assert result["status"] == "backup complete"
     assert offline.uploads == ["services"]
     assert dfu.check_backup_set_files(result["manifest"])["all_match"]
+
+
+def test_flash_image_without_partition_table_asks_for_one_target_partition(offline, tmp_path):
+    image = tmp_path / "services-only.img"
+    image.write_bytes(b"x" * 1024)
+    outcome, prompts = run_flow(BackupApi(offline.root), ["flash-images", str(image), "services", False])
+    assert prompts[2].kind == "select" and "services-only.img" in prompts[2].prompt
+    assert [item.key for item in prompts[2].items] == list(offline.layout)
+    assert prompts[3].kind == "confirm" and "services (1024 bytes)" in prompts[3].detail
+    assert offline.uploads == [] and not offline.forbidden

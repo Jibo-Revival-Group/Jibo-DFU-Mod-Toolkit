@@ -1241,7 +1241,7 @@ class ToolkitWindow:
                            ("All files", "*")), **options)
         else:
             chosen = filedialog.askopenfilename(
-                title="Choose an image", filetypes=(("Disk images", "*.img"),
+                title="Choose an image", filetypes=(("Disk images", "*.img *.bin"),
                                                     ("All files", "*")), **options)
         if chosen:
             value.set(str(chosen))
