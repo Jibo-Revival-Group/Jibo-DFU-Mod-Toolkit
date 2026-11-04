@@ -150,3 +150,53 @@ def test_real_window_drives_backend_backup_and_cancel_default_restore(offline):
         gate.set()
         c.shutdown()
         if not w.closed: w.close()
+
+
+def test_real_window_flash_images_picks_an_image_per_partition_and_cancel_writes_nothing(offline, tmp_path):
+    import jibo_gui as gui
+    image = tmp_path / "custom-services.img"
+    image.write_bytes(b"x" * 1024)
+    api = BackupApi(offline.root)
+    c = core.GuiController(api)
+    root = gui.create_root()
+    w = gui.ToolkitWindow(root, c)
+    errors = []
+    root.report_callback_exception = lambda *a: errors.append(a)
+    def pump(predicate):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            root.update()
+            assert not errors
+            if predicate(): return
+            time.sleep(0.01)
+        raise AssertionError("Timed out on " + w.page_name)
+    try:
+        with core.capture_output(c):
+            pump(lambda: c.snapshot().checked)
+            w.render_state()
+            w.action_rows["backups"].activate()
+            pump(lambda: w.prompt is not None)
+            assert "flash-images" in w.controls["options"]
+            previous = w.prompt
+            w.controls["choose"]("flash-images")
+            w.controls["primary"].invoke()
+            pump(lambda: w.prompt is not None and w.prompt is not previous and w.prompt.kind == "multi")
+            w.controls["all"](False)
+            w.controls["toggle"]("services")
+            w.controls["primary"].invoke()
+            pump(lambda: w.prompt is not None and w.prompt.kind == "text")
+            assert "services" in w.prompt.prompt
+            w.controls["value"].set(str(image))
+            w.controls["primary"].invoke()
+            pump(lambda: w.prompt is not None and w.prompt.kind == "confirm")
+            assert w.prompt.initial == "cancel"
+            assert root.focus_get() is w.controls["cancel"]
+            review = w.controls["review"].get()
+            assert "services (1024 bytes)" in review and str(image) in review
+            w.controls["cancel"].invoke()
+            pump(lambda: not c.busy and w.page_name == "result")
+            assert offline.uploads == [] and not offline.forbidden
+            assert api.saved_backups() == []
+    finally:
+        c.shutdown()
+        if not w.closed: w.close()

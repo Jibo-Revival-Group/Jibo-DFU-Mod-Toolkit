@@ -329,6 +329,7 @@ class BackupApi(FakeApi):
     def check_backup_set_files(self, *a): return dfu.check_backup_set_files(*a)
     def delete_backup_set(self, *a): return dfu.delete_backup_set(*a)
     def restore_partitions(self, *a, **kw): return dfu.restore_partitions(*a, dfu_util="fixture-dfu", **kw)
+    def flash_images(self, *a, **kw): return dfu.flash_images(*a, dfu_util="fixture-dfu", **kw)
     def open_folder(self, path):
         self.calls.append(("open_folder", path))
         return True  # Never launch the real desktop in acceptance tests.
