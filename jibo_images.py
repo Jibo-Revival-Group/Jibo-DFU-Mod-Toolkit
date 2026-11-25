@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 
@@ -27,13 +28,33 @@ class ImageError(Exception):
 
 
 def _chown_to_invoking_user(path):
-    if os.geteuid() == 0 and os.environ.get("SUDO_UID"):
+    if getattr(os, "geteuid", lambda: 1)() == 0 and os.environ.get("SUDO_UID"):
         try:
             uid = int(os.environ["SUDO_UID"])
             gid = int(os.environ.get("SUDO_GID", "-1"))
             os.chown(path, uid, gid)
         except (ValueError, OSError):
             pass
+
+
+def _host_path(path):
+    """A local path as debugfs sees it. Windows packagers (BEep) bundle a Cygwin debugfs:
+    give it the short (space-free) name with forward slashes."""
+    text = str(path)
+    if sys.platform != "win32":
+        return text
+    import ctypes
+    target = Path(text)
+    probe = target if target.exists() else target.parent
+    buffer = ctypes.create_unicode_buffer(32768)
+    if ctypes.windll.kernel32.GetShortPathNameW(str(probe), buffer, len(buffer)):
+        text = buffer.value if probe == target else str(Path(buffer.value) / target.name)
+    return text.replace("\\", "/")
+
+
+def _debugfs_arg(path):
+    """A local path inside a debugfs command, quoted so folders with spaces work."""
+    return '"' + _host_path(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _run_debugfs(image, command, writable=False, allow_missing=False):
@@ -43,7 +64,7 @@ def _run_debugfs(image, command, writable=False, allow_missing=False):
     argv = [executable]
     if writable:
         argv.append("-w")
-    argv.extend(("-R", command, str(image)))
+    argv.extend(("-R", command, _host_path(image)))
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -64,7 +85,7 @@ def _check_ext4(image):
     if not executable:
         raise ImageError("e2fsck is required to check edited images (install e2fsprogs).")
     try:
-        result = subprocess.run([executable, "-f", "-n", str(image)], capture_output=True,
+        result = subprocess.run([executable, "-f", "-n", _host_path(image)], capture_output=True,
                                 text=True, timeout=300)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ImageError("Could not check the ext4 image: " + str(exc)) from exc
@@ -85,7 +106,7 @@ def _replay_journal_on_copy(image):
     if not executable:
         raise ImageError("e2fsck is required to prepare ext4 images (install e2fsprogs).")
     try:
-        result = subprocess.run([executable, "-f", "-p", str(image)], capture_output=True,
+        result = subprocess.run([executable, "-f", "-p", _host_path(image)], capture_output=True,
                                 text=True, timeout=300)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ImageError("Could not check the working ext4 copy: " + str(exc)) from exc
@@ -101,7 +122,7 @@ def _extract(image, image_path, destination, optional=False):
     destination = Path(destination)
     if destination.exists():
         destination.unlink()
-    output = _run_debugfs(image, "dump " + image_path + " " + str(destination), allow_missing=optional)
+    output = _run_debugfs(image, "dump " + image_path + " " + _debugfs_arg(destination), allow_missing=optional)
     if not destination.is_file():
         if optional and re.search(r"File not found|ext2_lookup", output, re.IGNORECASE):
             return None
@@ -142,7 +163,7 @@ def _replace_file(image, image_path, content, workdir):
     replacement.write_bytes(content)
     replacement.chmod(0o600)
     _run_debugfs(image, "rm " + image_path, writable=True)
-    _run_debugfs(image, "write " + str(replacement) + " " + image_path, writable=True)
+    _run_debugfs(image, "write " + _debugfs_arg(replacement) + " " + image_path, writable=True)
     for field in ("mode", "uid", "gid"):
         _run_debugfs(image, "set_inode_field " + image_path + " " + field + " " + metadata[field],
                      writable=True)
@@ -164,7 +185,7 @@ def _put_factory_file(image, image_path, content, workdir, mode, source_metadata
     replacement = Path(workdir) / "replacement"
     replacement.write_bytes(content)
     replacement.chmod(0o600)
-    _run_debugfs(image, "write " + str(replacement) + " " + image_path, writable=True)
+    _run_debugfs(image, "write " + _debugfs_arg(replacement) + " " + image_path, writable=True)
     for field in ("mode", "uid", "gid"):
         _run_debugfs(image, "set_inode_field " + image_path + " " + field + " " + metadata[field],
                      writable=True)
@@ -391,7 +412,7 @@ def inspect_var(image):
     image = Path(image).expanduser().resolve()
     if not image.is_file():
         raise ImageError("Var image does not exist: " + str(image))
-    with tempfile.TemporaryDirectory(prefix="jibo-inspect-", dir="/tmp") as temp:
+    with tempfile.TemporaryDirectory(prefix="jibo-inspect-") as temp:
         working = Path(temp) / "var.img"
         shutil.copyfile(image, working)
         repaired = _replay_journal_on_copy(working)
@@ -411,7 +432,7 @@ def edit_mode(source, destination, mode):
         raise ImageError("Mode must be one of: " + ", ".join(MODE_VALUES))
     source, destination, repaired = _copy_for_edit(source, destination)
     try:
-        with tempfile.TemporaryDirectory(prefix="jibo-mode-", dir="/tmp") as temp:
+        with tempfile.TemporaryDirectory(prefix="jibo-mode-") as temp:
             current_raw = _extract(destination, VAR_MODE_PATH, Path(temp) / "mode.json")
             data = _json_mode(current_raw)
             previous = data["mode"]
@@ -854,7 +875,7 @@ def edit_wifi(source, destination, ssid, password=None, open_network=False,
               compact=False):
     source, destination, repaired = _copy_for_edit(source, destination)
     try:
-        with tempfile.TemporaryDirectory(prefix="jibo-wifi-", dir="/tmp") as temp:
+        with tempfile.TemporaryDirectory(prefix="jibo-wifi-") as temp:
             existing = _extract(destination, VAR_WIFI_PATH, Path(temp) / "wifi.conf", optional=True)
             replacement, count = build_wifi_config(existing, ssid, password,
                                                    open_network, compact=compact)
@@ -862,7 +883,7 @@ def edit_wifi(source, destination, ssid, password=None, open_network=False,
                 local = Path(temp) / "replacement"
                 local.write_bytes(replacement)
                 local.chmod(0o600)
-                _run_debugfs(destination, "write " + str(local) + " " + VAR_WIFI_PATH, writable=True)
+                _run_debugfs(destination, "write " + _debugfs_arg(local) + " " + VAR_WIFI_PATH, writable=True)
                 _run_debugfs(destination, "set_inode_field " + VAR_WIFI_PATH + " mode 0644", writable=True)
                 _run_debugfs(destination, "set_inode_field " + VAR_WIFI_PATH + " uid 0", writable=True)
                 _run_debugfs(destination, "set_inode_field " + VAR_WIFI_PATH + " gid 0", writable=True)
@@ -895,7 +916,7 @@ def edit_mode_wifi(source, destination, mode, ssid, password=None,
         raise ImageError("Mode must be one of: " + ", ".join(MODE_VALUES))
     source, destination, repaired = _copy_for_edit(source, destination)
     try:
-        with tempfile.TemporaryDirectory(prefix="jibo-mode-wifi-", dir="/tmp") as temp:
+        with tempfile.TemporaryDirectory(prefix="jibo-mode-wifi-") as temp:
             work = Path(temp)
             mode_data = _json_mode(_extract(destination, VAR_MODE_PATH, work / "mode.json"))
             previous = mode_data["mode"]
@@ -940,7 +961,7 @@ def edit_boot_network_status(source, destination, action):
     """Install/remove without changing mode or saved networks on one var copy."""
     source, destination, repaired = _copy_for_edit(source, destination)
     try:
-        with tempfile.TemporaryDirectory(prefix="jibo-boot-status-", dir="/tmp") as temp:
+        with tempfile.TemporaryDirectory(prefix="jibo-boot-status-") as temp:
             mode = _json_mode(_extract(destination, VAR_MODE_PATH, Path(temp) / "mode"))["mode"]
             expected = _apply_boot_network_status(destination, temp, action, mode)
             _replay_journal_on_copy(destination)
