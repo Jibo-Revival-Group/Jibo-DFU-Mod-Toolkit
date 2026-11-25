@@ -280,6 +280,23 @@ class FileDfuTests(unittest.TestCase):
             self.assertLess(events.index("ack"), events.index("post-stat"))
             self.assertEqual(events.count("backup:var"), 1)
 
+    def test_transaction_without_backup_writes_and_verifies_without_a_var_copy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            operation_dir = Path(temporary) / "operation"
+            events = []
+            patches = self._transaction_patches(operation_dir, events)
+            with patches[0], patches[1], patches[2], patches[3], patches[4] as backup, \
+                    patches[5], patches[6], patches[7], redirect_stdout(io.StringIO()):
+                transaction = j.FileTransaction(("var",), "1-2", "dfu-util", operation_dir,
+                                                backup=False)
+                transaction.replace("var", "/jibo/mode.json", b"new!")
+                with patch.object(j, "_read_partition_file_rpc", side_effect=[b"old", b"new!"]):
+                    result = transaction.commit(True)
+            self.assertEqual(result["status"], "verified")
+            self.assertEqual(result["backups"], {})
+            backup.assert_not_called()
+            self.assertEqual(events, ["stat", "write", "ack", "post-stat"])
+
     def test_transaction_rejects_permission_change_after_write(self):
         with tempfile.TemporaryDirectory() as temporary:
             operation_dir = Path(temporary) / "operation"

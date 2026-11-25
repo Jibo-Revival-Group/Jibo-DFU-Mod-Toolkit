@@ -10,7 +10,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import pwd
+try:
+    import pwd
+except ImportError:  # Windows
+    pwd = None
 import re
 import secrets
 import shutil
@@ -62,7 +65,7 @@ PIPELINE_HELPER = ROOT / "jibo_dfu_pipeline.py"
 
 
 def _invoking_user():
-    if os.geteuid() == 0 and os.environ.get("SUDO_UID"):
+    if getattr(os, "geteuid", lambda: 1)() == 0 and os.environ.get("SUDO_UID"):
         try:
             uid = int(os.environ["SUDO_UID"])
             gid = int(os.environ.get("SUDO_GID", "-1"))
@@ -104,7 +107,7 @@ class FileRpcStatusError(DfuError):
 
 
 def devices(root=None):
-    if root is None and sys.platform == "darwin":
+    if root is None and sys.platform in ("darwin", "win32"):
         try:
             return bounded.list_recovery_devices()
         except bounded.BoundedDfuError as exc:
@@ -364,7 +367,7 @@ def _transfer_error_detail(output):
 
 def tool(name, override=None):
     override = override or (os.environ.get("JIBO_DFU_UTIL") if name == "dfu-util" else None)
-    candidate = override or str(ROOT / "tools" / name)
+    candidate = override or str(ROOT / "tools" / (name + (".exe" if sys.platform == "win32" else "")))
     # Linux packages can leave ELF executables in tools/; Macs use native tools.
     if (override or sys.platform != "darwin") and Path(candidate).is_file():
         return str(Path(candidate).resolve())
@@ -405,9 +408,10 @@ def _partition_transfer_argv(dfu_util, port, alternative, option, path, size=Non
 
 def _shofel_dfu_tool(override=None):
     """Find a matched ShofEL host and launch-enabled RAM payload."""
-    candidate = override or os.environ.get("JIBO_SHOFEL2") or str(ROOT / "tools" / "shofel2_t124")
+    bundled = str(ROOT / "tools" / ("shofel2_t124.exe" if sys.platform == "win32" else "shofel2_t124"))
+    candidate = override or os.environ.get("JIBO_SHOFEL2") or bundled
     # tools/ may hold Linux ELF executables from a package build; Macs use a native host.
-    if candidate == str(ROOT / "tools" / "shofel2_t124") and sys.platform == "darwin":
+    if candidate == bundled and sys.platform == "darwin":
         candidate = None
     if not candidate or not Path(candidate).is_file():
         if override:
@@ -833,6 +837,9 @@ def _flock(stream, exclusive=False, wait=0.0):
     try:
         import fcntl
     except ImportError as exc:
+        # shortcut: Windows has no fcntl and its only caller (BEep) runs one operation at a time; add msvcrt locking if that changes.
+        if sys.platform == "win32":
+            return True
         raise DfuError("Backup locking is unavailable on this host. Nothing was deleted or restored.") from exc
     deadline = time.monotonic() + wait
     while True:
@@ -1379,7 +1386,7 @@ def open_folder(path):
         opener = shutil.which("xdg-open")
         if opener:
             commands.append([opener, str(folder)])
-    owner = _invoking_user() if os.geteuid() == 0 else None
+    owner = _invoking_user() if getattr(os, "geteuid", lambda: 1)() == 0 else None
     for argv in commands:
         options = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
                    "stderr": subprocess.DEVNULL, "start_new_session": True}
@@ -3079,7 +3086,7 @@ def read_partition_file_live(path, partition="var", port=None, dfu_util=None):
     _validate_file_path(path)
     dfu_util = dfu_util or tool("dfu-util")
     port, _, _, _ = _file_loader_context(port, dfu_util, (partition,), False)
-    with tempfile.TemporaryDirectory(prefix="jibo-file-read-", dir="/tmp") as temp:
+    with tempfile.TemporaryDirectory(prefix="jibo-file-read-") as temp:
         return _read_partition_file_rpc(dfu_util, port, partition, path, temp)
 
 
@@ -3088,7 +3095,7 @@ def stat_partition_file_live(path, partition="var", port=None, dfu_util=None):
     _validate_file_path(path)
     dfu_util = dfu_util or tool("dfu-util")
     port, _, _, _ = _file_loader_context(port, dfu_util, (partition,), False)
-    with tempfile.TemporaryDirectory(prefix="jibo-file-stat-", dir="/tmp") as temp:
+    with tempfile.TemporaryDirectory(prefix="jibo-file-stat-") as temp:
         details = _stat_partition_file_rpc(dfu_util, port, partition, path, temp)
     return {"status": "stat", "partition": partition, "path": path,
             "permissions_octal": format(stat.S_IMODE(details["mode"]), "04o"),
@@ -3121,7 +3128,7 @@ def _partition_file_backup(dfu_util, port, device_tag, partition, size, names,
 class FileTransaction:
     """A reviewed batch of existing-file replacements with a reusable var baseline."""
 
-    def __init__(self, partitions, port=None, dfu_util=None, out=None, guided=False):
+    def __init__(self, partitions, port=None, dfu_util=None, out=None, guided=False, backup=True):
         requested = tuple(dict.fromkeys(partitions))
         if not requested or any(partition not in FILE_LEVEL_PARTITIONS for partition in requested):
             raise DfuError("Declare one or more supported ext4 partitions: " +
@@ -3133,6 +3140,7 @@ class FileTransaction:
         self.edits = []
         self._committed = False
         self.guided = guided
+        self.backup = backup  # False: write without saving the var baseline first (the caller said so)
 
     def replace(self, partition, path, content, description=None):
         if self._committed:
@@ -3178,7 +3186,7 @@ class FileTransaction:
                   "device_tag": device_tag, "partitions": list(touched),
                   "backups": {}, "writes": [], "status": "preparing baselines"}
         _private_write(record_path, record)
-        request_dir = Path(tempfile.mkdtemp(prefix="jibo-file-rpc-", dir="/tmp"))
+        request_dir = Path(tempfile.mkdtemp(prefix="jibo-file-rpc-"))
         os.chmod(request_dir, 0o700)
         try:
             if self.guided:
@@ -3258,7 +3266,7 @@ class FileTransaction:
             if self.guided and "var" in touched:
                 print("Checking the rollback backup…", flush=True)
             for partition in touched:
-                if partition != "var":
+                if partition != "var" or not self.backup:
                     continue
                 size = capacities.get(partition)
                 if not size:
@@ -3372,7 +3380,7 @@ def write_partition_file_live(partition, path, content, port=None, dfu_util=None
 
 
 def set_mode_file_live(mode, partition="var", port=None, dfu_util=None,
-                       out=None, confirmation=None, guided=False):
+                       out=None, confirmation=None, guided=False, backup=True):
     if mode not in images.MODE_VALUES:
         raise DfuError("Mode must be one of: " + ", ".join(images.MODE_VALUES))
     details = {}
@@ -3383,7 +3391,7 @@ def set_mode_file_live(mode, partition="var", port=None, dfu_util=None,
             return current
         data["mode"] = mode
         return (json.dumps(data, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
-    transaction = FileTransaction((partition,), port, dfu_util, out, guided=guided)
+    transaction = FileTransaction((partition,), port, dfu_util, out, guided=guided, backup=backup)
     transaction.transform(partition, images.VAR_MODE_PATH, change_mode,
                           description="robot mode to " + mode)
     result = transaction.commit(confirmation)
@@ -3851,6 +3859,7 @@ def main(argv=None):
     _add_dfu_argument(mode_file)
     _add_operation_argument(mode_file)
     mode_file.add_argument("--yes", action="store_true", help="Confirm the reviewed file replacement plan")
+    mode_file.add_argument("--no-backup", action="store_true", help="Do not save a var backup before the write")
     wifi_file = sub.add_parser("configure-wifi-file",
                                help="Add or update Wi-Fi in its existing file")
     wifi_file.add_argument("--ssid", required=True)
@@ -4032,7 +4041,8 @@ def main(argv=None):
         elif args.command == "set-mode-file":
             result = set_mode_file_live(args.mode, args.partition, args.port,
                                         tool("dfu-util", args.dfu_util),
-                                        args.operation_dir, True if args.yes else None)
+                                        args.operation_dir, True if args.yes else None,
+                                        backup=not args.no_backup)
         elif args.command == "configure-wifi-file":
             password = _password_from_args(args)
             result = configure_wifi_file_live(

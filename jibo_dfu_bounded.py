@@ -139,6 +139,15 @@ def _load_libusb():
 
     lib.libusb_init.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
     lib.libusb_init.restype = ctypes.c_int
+    if sys.platform == "win32":
+        # Windows: use the signed UsbDk driver so no per-device driver install is needed.
+        raw_init = lib.libusb_init
+        def init_with_usbdk(reference):
+            rc = raw_init(reference)
+            if rc == 0:
+                lib.libusb_set_option(reference._obj, ctypes.c_int(1))  # LIBUSB_OPTION_USE_USBDK
+            return rc
+        lib.libusb_init = init_with_usbdk
     lib.libusb_exit.argtypes = [ctypes.c_void_p]
     lib.libusb_exit.restype = None
     lib.libusb_get_device_list.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(_DeviceP))]
